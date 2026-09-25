@@ -1,0 +1,108 @@
+name: SSH Tunnel Debug (ngrok)
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "Durée max du tunnel (minutes)"
+        required: false
+        default: "30"
+
+jobs:
+  ssh-tunnel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Générer les clés SSH
+        run: |
+          rm -rf ~/.ssh
+          mkdir -p ~/.ssh
+          ssh-keygen -f ~/.ssh/id_rsa -N ""
+          cp ~/.ssh/id_rsa.pub ~/.ssh/authorized_keys
+          chmod 700 ~/.ssh
+          chmod 600 ~/.ssh/authorized_keys
+
+      - name: Installer et configurer sshd statique
+        run: |
+          mkdir -p /tmp/ssh_static
+          wget -q "https://github.com/pkgforge-dev/static-toolbox/releases/download/openssh-V_9_7_P1/sshd_amd_x86_64_Linux" -O /tmp/ssh_static/sshd
+          wget -q "https://github.com/pkgforge-dev/static-toolbox/releases/download/openssh-V_9_7_P1/ssh-keygen_amd_x86_64_Linux" -O /tmp/ssh_static/ssh-keygen
+
+          filesize=$(stat -c%s /tmp/ssh_static/sshd)
+          if [ "$filesize" -lt 1000000 ]; then
+            echo "Téléchargement du binaire sshd invalide." >&2
+            exit 1
+          fi
+
+          chmod +x /tmp/ssh_static/sshd /tmp/ssh_static/ssh-keygen
+          sudo cp /tmp/ssh_static/sshd /usr/local/bin/sshd
+          sudo cp /tmp/ssh_static/ssh-keygen /usr/local/bin/ssh-keygen-static
+
+      - name: Générer les host keys
+        run: |
+          sudo mkdir -p /etc/ssh
+          sudo rm -f /etc/ssh/ssh_host_*
+          sudo ssh-keygen -q -t rsa -b 3072 -f /etc/ssh/ssh_host_rsa_key -N ""
+          sudo ssh-keygen -q -t ecdsa -f /etc/ssh/ssh_host_ecdsa_key -N ""
+          sudo ssh-keygen -q -t ed25519 -f /etc/ssh/ssh_host_ed25519_key -N ""
+          sudo mkdir -p /var/empty
+          sudo chmod 755 /var/empty
+
+      - name: Créer sshd_config
+        run: |
+          sudo tee /etc/ssh/sshd_config > /dev/null << 'EOF'
+          Port 2222
+          HostKey /etc/ssh/ssh_host_rsa_key
+          HostKey /etc/ssh/ssh_host_ecdsa_key
+          HostKey /etc/ssh/ssh_host_ed25519_key
+          PermitRootLogin no
+          PasswordAuthentication no
+          PubkeyAuthentication yes
+          AuthorizedKeysFile /home/runner/.ssh/authorized_keys
+          PermitUserEnvironment yes
+          AcceptEnv PATH LD_LIBRARY_PATH
+          Subsystem sftp internal-sftp
+          EOF
+
+      - name: Démarrer sshd
+        run: |
+          sudo /usr/local/bin/sshd -D -e -f /etc/ssh/sshd_config &
+          sleep 2
+          ss -tlnp 2>/dev/null | grep :2222 || netstat -tlnp 2>/dev/null | grep :2222
+
+      - name: Installer pyngrok et ouvrir le tunnel
+        env:
+          NGROK_TOKEN: ${{ secrets.NGROK_TOKEN }}
+          DURATION_MINUTES: ${{ github.event.inputs.duration_minutes }}
+        run: |
+          pip install --quiet pyngrok
+
+          python3 - << 'PYEOF'
+          import os, time
+          from pyngrok import ngrok, conf
+
+          conf.get_default().auth_token = os.environ["NGROK_TOKEN"]
+          tunnel = ngrok.connect(2222, "tcp")
+
+          url = tunnel.public_url.replace("tcp://", "")
+          host, port = url.split(":")
+
+          print(f"\n=== Tunnel ouvert : {tunnel.public_url} ===")
+          print(f"Commande SSH locale :")
+          print(f"ssh runner@{host} -p {port} -i id_rsa -o ServerAliveInterval=60\n")
+
+          duration = int(os.environ.get("DURATION_MINUTES", "30")) * 60
+          elapsed = 0
+          while elapsed < duration:
+              time.sleep(30)
+              elapsed += 30
+              print(f"Tunnel actif depuis {elapsed // 60} min...")
+
+          ngrok.disconnect(tunnel.public_url)
+          print("Tunnel fermé (durée max atteinte).")
+          PYEOF
+
+      - name: Afficher la clé privée (à copier localement)
+        run: |
+          echo "!!! Copiez cette clé privée dans un fichier local id_rsa (chmod 600) !!!"
+          cat ~/.ssh/id_rsa
